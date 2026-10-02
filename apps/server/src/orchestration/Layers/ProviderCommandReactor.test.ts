@@ -24,6 +24,7 @@ import {
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
+import * as Cause from "effect/Cause";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import * as PubSub from "effect/PubSub";
@@ -32,12 +33,17 @@ import * as Stream from "effect/Stream";
 import { it as effectIt } from "@effect/vitest";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
+import type { OrchestrationDispatchError } from "../Errors.ts";
+import { ServerActivation } from "../../serverActivation.ts";
 import { deriveServerPaths, ServerConfig } from "../../config.ts";
 import { TextGenerationError } from "@t3tools/contracts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
-import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import {
+  SqlitePersistenceMemory,
+  makeSqlitePersistenceLive,
+} from "../../persistence/Layers/Sqlite.ts";
 import {
   ProviderService,
   type ProviderServiceShape,
@@ -145,6 +151,15 @@ describe("ProviderCommandReactor", () => {
 
   async function createHarness(input?: {
     readonly baseDir?: string;
+    readonly persistent?: boolean;
+    readonly startReactor?: boolean;
+    readonly activation?: Effect.Effect<void>;
+    readonly beforeRecoveryDispatch?: (
+      engine: OrchestrationEngineService["Service"],
+    ) => Effect.Effect<unknown, OrchestrationDispatchError>;
+    readonly beforeStart?: (
+      engine: OrchestrationEngineService["Service"],
+    ) => Effect.Effect<unknown, OrchestrationDispatchError>;
     readonly threadModelSelection?: ModelSelection;
     readonly sessionModelSwitch?: "unsupported" | "in-session";
     readonly requiresNewThreadForModelChange?: boolean;
@@ -345,6 +360,9 @@ describe("ProviderCommandReactor", () => {
       },
     };
 
+    const persistenceLayer = input?.persistent
+      ? makeSqlitePersistenceLive(NodePath.join(baseDir, "callback-test.sqlite"))
+      : SqlitePersistenceMemory;
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
       Layer.provide(ThreadBackgroundLiveness.layer),
@@ -353,13 +371,13 @@ describe("ProviderCommandReactor", () => {
       Layer.provide(OrchestrationEventStoreLive),
       Layer.provide(OrchestrationCommandReceiptRepositoryLive),
       Layer.provide(RepositoryIdentityResolver.layer),
-      Layer.provide(SqlitePersistenceMemory),
+      Layer.provide(persistenceLayer),
     );
     const projectionSnapshotLayer = OrchestrationProjectionSnapshotQueryLive.pipe(
       Layer.provide(ThreadBackgroundLiveness.layer),
       Layer.provide(ThreadPlanProgress.layer),
       Layer.provide(RepositoryIdentityResolver.layer),
-      Layer.provide(SqlitePersistenceMemory),
+      Layer.provide(persistenceLayer),
     );
     let titleRegenerationCompletionDispatchAttempts = 0;
     const reactorOrchestrationLayer = Layer.effect(
@@ -369,6 +387,14 @@ describe("ProviderCommandReactor", () => {
         return {
           readEvents: engine.readEvents,
           dispatch: (command) => {
+            if (
+              command.type === "thread.turn.start" &&
+              command.userInputRecovery !== undefined &&
+              input?.beforeRecoveryDispatch
+            ) {
+              const beforeRecoveryDispatch = input.beforeRecoveryDispatch;
+              return beforeRecoveryDispatch(engine).pipe(Effect.andThen(engine.dispatch(command)));
+            }
             if (command.type === "thread.title.regeneration.complete") {
               titleRegenerationCompletionDispatchAttempts += 1;
               if (
@@ -415,6 +441,7 @@ describe("ProviderCommandReactor", () => {
       Layer.provideMerge(ServerSettingsService.layerTest()),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
       Layer.provideMerge(NodeServices.layer),
+      Layer.provide(Layer.succeed(ServerActivation, input?.activation)),
     );
     runtime = ManagedRuntime.make(layer);
 
@@ -423,32 +450,35 @@ describe("ProviderCommandReactor", () => {
     const reactor = await runtime.runPromise(Effect.service(ProviderCommandReactor));
     const runEffect = <A, E>(effect: Effect.Effect<A, E>) => runtime!.runPromise(effect);
 
-    await Effect.runPromise(
-      engine.dispatch({
-        type: "project.create",
-        commandId: CommandId.make("cmd-project-create"),
-        projectId: asProjectId("project-1"),
-        title: "Provider Project",
-        workspaceRoot: "/tmp/provider-project",
-        defaultModelSelection: modelSelection,
-        createdAt: now,
-      }),
-    );
-    await Effect.runPromise(
-      engine.dispatch({
-        type: "thread.create",
-        commandId: CommandId.make("cmd-thread-create"),
-        threadId: ThreadId.make("thread-1"),
-        projectId: asProjectId("project-1"),
-        title: "Thread",
-        modelSelection: modelSelection,
-        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-        runtimeMode: "approval-required",
-        branch: null,
-        worktreePath: null,
-        createdAt: now,
-      }),
-    );
+    const existing = await runEffect(snapshotQuery.getCommandReadModel());
+    if (existing.threads.length === 0) {
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "project.create",
+          commandId: CommandId.make("cmd-project-create"),
+          projectId: asProjectId("project-1"),
+          title: "Provider Project",
+          workspaceRoot: "/tmp/provider-project",
+          defaultModelSelection: modelSelection,
+          createdAt: now,
+        }),
+      );
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("cmd-thread-create"),
+          threadId: ThreadId.make("thread-1"),
+          projectId: asProjectId("project-1"),
+          title: "Thread",
+          modelSelection: modelSelection,
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt: now,
+        }),
+      );
+    }
     if (input?.titleRegenerationBeforeStart === "two") {
       await Effect.runPromise(
         engine.dispatch({
@@ -485,13 +515,25 @@ describe("ProviderCommandReactor", () => {
       );
     }
 
+    if (input?.beforeStart) await runEffect(input.beforeStart(engine));
     scope = await Effect.runPromise(Scope.make("sequential"));
-    await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
+    if (input?.startReactor !== false)
+      await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
     const drain = () => Effect.runPromise(reactor.drain);
 
     return {
       engine,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
+      pendingResponses: () => snapshotQuery.getPendingUserInputResponses(),
+      readModelEffect: snapshotQuery.getSnapshot(),
+      drainEffect: reactor.drain,
+      dispose: Effect.gen(function* () {
+        if (scope) yield* Scope.close(scope, Exit.void);
+        scope = null;
+        const currentRuntime = runtime;
+        if (currentRuntime) yield* Effect.promise(() => currentRuntime.dispose());
+        runtime = null;
+      }),
       startSession,
       sendTurn,
       interruptTurn,
@@ -511,6 +553,639 @@ describe("ProviderCommandReactor", () => {
       },
     };
   }
+
+  const expectRejected = <A, E>(effect: Effect.Effect<A, E>, detail: string) =>
+    Effect.gen(function* () {
+      const result = yield* Effect.exit(effect);
+      expect(Exit.isFailure(result)).toBe(true);
+      if (Exit.isFailure(result)) expect(Cause.pretty(result.cause)).toContain(detail);
+    });
+
+  const callbackNow = "2026-01-01T00:00:00.000Z";
+  const callbackThreadId = ThreadId.make("thread-1");
+  const callbackRequestId = ApprovalRequestId.make("durable-question");
+  const callbackActivityId = EventId.make("durable-question-activity");
+  const answerCommand = (
+    id: string,
+    answers: Record<string, unknown> = { choice: "Continue with option A" },
+  ) => ({
+    type: "thread.user-input.respond" as const,
+    commandId: CommandId.make(id),
+    threadId: callbackThreadId,
+    requestId: callbackRequestId,
+    answers,
+    createdAt: callbackNow,
+  });
+  const seedQuestion = (engine: OrchestrationEngineService["Service"]) =>
+    engine.dispatch({
+      type: "thread.activity.append",
+      commandId: CommandId.make("durable-question-seed"),
+      threadId: callbackThreadId,
+      createdAt: callbackNow,
+      activity: {
+        id: callbackActivityId,
+        kind: "user-input.requested",
+        tone: "info",
+        summary: "Question",
+        turnId: null,
+        createdAt: callbackNow,
+        payload: {
+          requestId: callbackRequestId,
+          questions: [
+            {
+              id: "choice",
+              header: "Choose",
+              question: "Which approach should we use?",
+              options: [],
+            },
+          ],
+        },
+      },
+    });
+  const seedRunningSession = (engine: OrchestrationEngineService["Service"]) =>
+    engine.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make("durable-session-seed"),
+      threadId: callbackThreadId,
+      createdAt: callbackNow,
+      session: {
+        threadId: callbackThreadId,
+        status: "running",
+        providerName: "codex",
+        runtimeMode: "approval-required",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: callbackNow,
+      },
+    });
+  const seedMarker = (engine: OrchestrationEngineService["Service"], kind: string) =>
+    engine.dispatch({
+      type: "thread.activity.append",
+      commandId: CommandId.make(`seed:${kind}`),
+      threadId: callbackThreadId,
+      createdAt: callbackNow,
+      activity: {
+        id: EventId.make(`seed:${kind}`),
+        kind,
+        tone: "info",
+        summary: "Delivery marker",
+        turnId: null,
+        createdAt: callbackNow,
+        payload: { requestId: callbackRequestId, requestActivityId: callbackActivityId },
+      },
+    });
+
+  effectIt.effect(
+    "atomically accepts one of two device answers and ignores replay of the accepted command",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness());
+        yield* seedQuestion(harness.engine);
+        yield* seedRunningSession(harness.engine);
+        const results = yield* Effect.all(
+          [
+            harness.engine.dispatch(answerCommand("device-one")).pipe(Effect.exit),
+            harness.engine.dispatch(answerCommand("device-two")).pipe(Effect.exit),
+          ],
+          { concurrency: "unbounded" },
+        );
+        expect(results.filter(Exit.isSuccess)).toHaveLength(1);
+        expect(results.filter(Exit.isFailure)).toHaveLength(1);
+        yield* harness.engine.dispatch(answerCommand("device-one"));
+        yield* harness.drainEffect;
+        expect(harness.respondToUserInput).toHaveBeenCalledTimes(1);
+        expect(harness.sendTurn).not.toHaveBeenCalled();
+        expect(yield* harness.pendingResponses()).toEqual([]);
+      }),
+  );
+
+  effectIt.effect.each([
+    {},
+    { choice: " " },
+    { wrong: "answer" },
+    { choice: [] },
+    { choice: "A", unexpected: "B" },
+  ])("rejects incomplete or unrelated answers before calling a provider: %j", (answers) =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() => createHarness());
+      yield* seedQuestion(harness.engine);
+      yield* expectRejected(
+        harness.engine.dispatch(answerCommand("invalid-answer", answers)),
+        "Answer every question",
+      );
+      yield* harness.drainEffect;
+      expect(harness.respondToUserInput).not.toHaveBeenCalled();
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+    }),
+  );
+
+  effectIt.effect("rejects unknown questions and answers from a different thread", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() => createHarness());
+      yield* expectRejected(
+        harness.engine.dispatch(answerCommand("unknown-answer")),
+        "no longer pending",
+      );
+      yield* seedQuestion(harness.engine);
+      yield* harness.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("other-thread"),
+        threadId: ThreadId.make("other-thread"),
+        projectId: asProjectId("project-1"),
+        title: "Other",
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        branch: null,
+        worktreePath: null,
+        createdAt: callbackNow,
+      });
+      yield* expectRejected(
+        harness.engine.dispatch({
+          ...answerCommand("cross-thread"),
+          threadId: ThreadId.make("other-thread"),
+        }),
+        "no longer pending",
+      );
+      yield* harness.drainEffect;
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+    }),
+  );
+
+  effectIt.effect.each(["codex", "claudeAgent", "cursor", "grok", "opencode"])(
+    "recovers a definitively lost callback through the shared command path for %s",
+    (provider) =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            threadModelSelection: {
+              instanceId: ProviderInstanceId.make(provider),
+              model: "test-model",
+            },
+          }),
+        );
+        yield* seedQuestion(harness.engine);
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("provider-session"),
+          threadId: callbackThreadId,
+          createdAt: callbackNow,
+          session: {
+            threadId: callbackThreadId,
+            status: "running",
+            providerName: provider,
+            providerInstanceId: ProviderInstanceId.make(provider),
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: callbackNow,
+          },
+        });
+        harness.respondToUserInput.mockImplementation(() =>
+          Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: ProviderDriverKind.make(provider),
+              method: "respondToUserInput",
+              detail: `Unknown pending user-input request: ${callbackRequestId}`,
+            }),
+          ),
+        );
+        yield* harness.engine.dispatch(answerCommand(`provider-answer:${provider}`));
+        yield* harness.drainEffect;
+        expect(harness.respondToUserInput).toHaveBeenCalledTimes(1);
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        expect((yield* harness.readModelEffect).threads[0]?.modelSelection.instanceId).toBe(
+          provider,
+        );
+        expect(yield* harness.pendingResponses()).toEqual([]);
+      }),
+  );
+
+  effectIt.effect(
+    "restores the exact question and saved answer accepted before the reactor started",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            beforeStart: (engine) =>
+              Effect.gen(function* () {
+                yield* seedQuestion(engine);
+                yield* engine.dispatch(answerCommand("answer-before-start"));
+              }),
+          }),
+        );
+        yield* harness.drainEffect;
+        expect(harness.respondToUserInput).not.toHaveBeenCalled();
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        const thread = (yield* harness.readModelEffect).threads[0];
+        expect(thread?.messages[0]?.text).toContain("Which approach should we use?");
+        expect(thread?.messages[0]?.text).toContain("Continue with option A");
+        expect(thread?.runtimeMode).toBe("approval-required");
+        expect(yield* harness.pendingResponses()).toEqual([]);
+        yield* expectRejected(
+          harness.engine.dispatch(answerCommand("late-answer")),
+          "no longer pending",
+        );
+      }),
+  );
+
+  effectIt.effect("does not resend an answer whose native delivery outcome became unknown", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          beforeStart: (engine) =>
+            Effect.gen(function* () {
+              yield* seedQuestion(engine);
+              yield* seedRunningSession(engine);
+              yield* engine.dispatch(answerCommand("interrupted-answer"));
+              yield* seedMarker(engine, "user-input.delivery.started");
+            }),
+        }),
+      );
+      yield* harness.drainEffect;
+      expect(harness.respondToUserInput).not.toHaveBeenCalled();
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+      expect(
+        (yield* harness.readModelEffect).threads[0]?.activities.find(
+          (activity) => activity.kind === "provider.user-input.respond.failed",
+        )?.payload,
+      ).toMatchObject({ detail: expect.stringContaining("outcome is unknown") });
+      expect(yield* harness.pendingResponses()).toEqual([]);
+    }),
+  );
+
+  effectIt.effect(
+    "resumes after a definitively missing callback was recorded before interruption",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            beforeStart: (engine) =>
+              Effect.gen(function* () {
+                yield* seedQuestion(engine);
+                yield* engine.dispatch(answerCommand("callback-missing-answer"));
+                yield* seedMarker(engine, "user-input.delivery.started");
+                yield* seedMarker(engine, "user-input.callback-unavailable");
+              }),
+          }),
+        );
+        yield* harness.drainEffect;
+        expect(harness.respondToUserInput).not.toHaveBeenCalled();
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+      }),
+  );
+
+  effectIt.effect("does not duplicate a continuation after interruption while queuing it", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          beforeStart: (engine) =>
+            Effect.gen(function* () {
+              yield* seedQuestion(engine);
+              yield* engine.dispatch(answerCommand("interrupted-recovery"));
+              yield* seedMarker(engine, "user-input.recovery.started");
+            }),
+        }),
+      );
+      yield* harness.drainEffect;
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+      expect(yield* harness.pendingResponses()).toEqual([]);
+    }),
+  );
+
+  effectIt.effect("rejects a saved answer superseded by a newer turn before delivery", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          beforeStart: (engine) =>
+            Effect.gen(function* () {
+              yield* seedQuestion(engine);
+              yield* engine.dispatch(answerCommand("superseded-answer"));
+              yield* engine.dispatch({
+                type: "thread.turn.start",
+                commandId: CommandId.make("newer-turn"),
+                threadId: callbackThreadId,
+                message: {
+                  messageId: asMessageId("newer-message"),
+                  role: "user",
+                  text: "New task",
+                  attachments: [],
+                },
+                interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+                runtimeMode: "approval-required",
+                createdAt: "2026-01-01T00:00:01.000Z",
+              });
+            }),
+        }),
+      );
+      yield* harness.drainEffect;
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+      expect(harness.respondToUserInput).not.toHaveBeenCalled();
+      yield* expectRejected(
+        harness.engine.dispatch(answerCommand("late-device-answer")),
+        "no longer pending",
+      );
+    }),
+  );
+
+  effectIt.effect(
+    "reconciles a native provider resolution persisted before the delivery receipt",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            beforeStart: (engine) =>
+              Effect.gen(function* () {
+                yield* seedQuestion(engine);
+                yield* engine.dispatch(answerCommand("already-delivered"));
+                yield* seedMarker(engine, "user-input.delivery.started");
+                yield* engine.dispatch({
+                  type: "thread.activity.append",
+                  commandId: CommandId.make("native-resolution"),
+                  threadId: callbackThreadId,
+                  createdAt: callbackNow,
+                  activity: {
+                    id: EventId.make("native-resolution"),
+                    kind: "user-input.resolved",
+                    tone: "info",
+                    summary: "Answered",
+                    turnId: null,
+                    createdAt: callbackNow,
+                    payload: {
+                      requestId: callbackRequestId,
+                      answers: { choice: "Continue with option A" },
+                    },
+                  },
+                });
+              }),
+          }),
+        );
+        yield* harness.drainEffect;
+        expect(harness.sendTurn).not.toHaveBeenCalled();
+        expect(harness.respondToUserInput).not.toHaveBeenCalled();
+        expect(yield* harness.pendingResponses()).toEqual([]);
+        expect(
+          (yield* harness.readModelEffect).threads[0]?.activities.some(
+            (activity) => activity.kind === "provider.user-input.respond.failed",
+          ),
+        ).toBe(false);
+      }),
+  );
+
+  effectIt.effect(
+    "does not turn an uncertain transport failure into a second provider action",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness());
+        yield* seedQuestion(harness.engine);
+        yield* seedRunningSession(harness.engine);
+        harness.respondToUserInput.mockImplementation(() =>
+          Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: ProviderDriverKind.make("codex"),
+              method: "respondToUserInput",
+              detail: "Transport closed after sending",
+            }),
+          ),
+        );
+        yield* harness.engine.dispatch(answerCommand("transport-error"));
+        yield* harness.drainEffect;
+        expect(harness.respondToUserInput).toHaveBeenCalledTimes(1);
+        expect(harness.sendTurn).not.toHaveBeenCalled();
+        expect(yield* harness.pendingResponses()).toEqual([]);
+        yield* expectRejected(
+          harness.engine.dispatch(answerCommand("retry-transport-error")),
+          "already been accepted",
+        );
+      }),
+  );
+
+  effectIt.effect(
+    "rejects a reused request id rather than applying a late answer to a new question",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness());
+        yield* seedQuestion(harness.engine);
+        yield* harness.engine.dispatch({
+          type: "thread.activity.append",
+          commandId: CommandId.make("reused-id"),
+          threadId: callbackThreadId,
+          createdAt: callbackNow,
+          activity: {
+            id: EventId.make("different-question"),
+            kind: "user-input.requested",
+            tone: "info",
+            summary: "Different question",
+            turnId: null,
+            createdAt: callbackNow,
+            payload: {
+              requestId: callbackRequestId,
+              questions: [
+                { id: "choice", header: "Choose", question: "Delete the project?", options: [] },
+              ],
+            },
+          },
+        });
+        yield* expectRejected(
+          harness.engine.dispatch(answerCommand("late-answer-reused-id")),
+          "reused this question id",
+        );
+        yield* harness.drainEffect;
+        expect(harness.sendTurn).not.toHaveBeenCalled();
+      }),
+  );
+
+  effectIt.effect(
+    "does not deliver a saved answer after the user changes the selected provider",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            beforeStart: (engine) =>
+              Effect.gen(function* () {
+                yield* seedQuestion(engine);
+                yield* engine.dispatch(answerCommand("answer-before-provider-change"));
+                yield* engine.dispatch({
+                  type: "thread.meta.update",
+                  commandId: CommandId.make("provider-change"),
+                  threadId: callbackThreadId,
+                  modelSelection: {
+                    instanceId: ProviderInstanceId.make("claudeAgent"),
+                    model: "claude-sonnet-4-5",
+                  },
+                });
+              }),
+          }),
+        );
+        yield* harness.drainEffect;
+        expect(harness.sendTurn).not.toHaveBeenCalled();
+        expect(harness.respondToUserInput).not.toHaveBeenCalled();
+        expect(yield* harness.pendingResponses()).toEqual([]);
+      }),
+  );
+
+  effectIt.effect(
+    "does not restore full access if the user lowers permissions just before recovery commits",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            beforeRecoveryDispatch: (engine) =>
+              Effect.gen(function* () {
+                yield* engine.dispatch({
+                  type: "thread.runtime-mode.set",
+                  commandId: CommandId.make("lower-permissions"),
+                  createdAt: callbackNow,
+                  threadId: callbackThreadId,
+                  runtimeMode: "approval-required",
+                });
+              }),
+          }),
+        );
+        yield* harness.engine.dispatch({
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make("initial-full-access"),
+          createdAt: callbackNow,
+          threadId: callbackThreadId,
+          runtimeMode: "full-access",
+        });
+        yield* harness.drainEffect;
+        harness.sendTurn.mockClear();
+        yield* seedQuestion(harness.engine);
+        yield* harness.engine.dispatch(answerCommand("permission-race-answer"));
+        yield* harness.drainEffect;
+        expect(harness.sendTurn).not.toHaveBeenCalled();
+        expect((yield* harness.readModelEffect).threads[0]?.runtimeMode).toBe("approval-required");
+        expect(yield* harness.pendingResponses()).toEqual([]);
+      }),
+  );
+
+  effectIt.effect("does not revert a provider change made just before recovery commits", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          beforeRecoveryDispatch: (engine) =>
+            Effect.gen(function* () {
+              yield* engine.dispatch({
+                type: "thread.meta.update",
+                commandId: CommandId.make("racing-provider-change"),
+                threadId: callbackThreadId,
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("claudeAgent"),
+                  model: "claude-sonnet-4-5",
+                },
+              });
+            }),
+        }),
+      );
+      yield* seedQuestion(harness.engine);
+      yield* harness.engine.dispatch(answerCommand("provider-race-answer"));
+      yield* harness.drainEffect;
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+      expect((yield* harness.readModelEffect).threads[0]?.modelSelection.instanceId).toBe(
+        "claudeAgent",
+      );
+      expect(yield* harness.pendingResponses()).toEqual([]);
+    }),
+  );
+
+  effectIt.effect("parks recovered provider work until the server activation boundary", () =>
+    Effect.gen(function* () {
+      const activation = yield* Deferred.make<void>();
+      const sessionStarted = yield* Deferred.make<void>();
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          activation: Deferred.await(activation),
+          startSessionEffect: (session) =>
+            Deferred.succeed(sessionStarted, undefined).pipe(Effect.as(session)),
+          beforeStart: (engine) =>
+            Effect.gen(function* () {
+              yield* seedQuestion(engine);
+              yield* engine.dispatch(answerCommand("activation-answer"));
+            }),
+        }),
+      );
+      expect(harness.startSession).not.toHaveBeenCalled();
+      expect(harness.sendTurn).not.toHaveBeenCalled();
+      yield* Deferred.succeed(activation, undefined);
+      yield* Deferred.await(sessionStarted);
+      yield* harness.drainEffect;
+      expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+      expect(yield* harness.pendingResponses()).toEqual([]);
+    }),
+  );
+
+  effectIt.effect(
+    "rehydrates an accepted response from SQLite and does not replay it on a second restart",
+    () =>
+      Effect.gen(function* () {
+        const baseDir = NodeFS.mkdtempSync(
+          NodePath.join(NodeOS.tmpdir(), "t3-claimed-answer-restart-"),
+        );
+        const first = yield* Effect.promise(() =>
+          createHarness({ persistent: true, baseDir, startReactor: false }),
+        );
+        yield* seedQuestion(first.engine);
+        yield* first.engine.dispatch(answerCommand("durably-accepted"));
+        expect(yield* first.pendingResponses()).toHaveLength(1);
+        yield* first.dispose;
+        const restarted = yield* Effect.promise(() => createHarness({ persistent: true, baseDir }));
+        yield* restarted.drainEffect;
+        expect(restarted.sendTurn).toHaveBeenCalledTimes(1);
+        expect(yield* restarted.pendingResponses()).toEqual([]);
+        yield* restarted.dispose;
+        const restartedAgain = yield* Effect.promise(() =>
+          createHarness({ persistent: true, baseDir }),
+        );
+        yield* restartedAgain.drainEffect;
+        expect(restartedAgain.sendTurn).not.toHaveBeenCalled();
+        expect(yield* restartedAgain.pendingResponses()).toEqual([]);
+      }),
+  );
+
+  effectIt.effect(
+    "retains unanswered questions outside the activity window across a real database restart",
+    () =>
+      Effect.gen(function* () {
+        const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-callback-restart-"));
+        const first = yield* Effect.promise(() => createHarness({ persistent: true, baseDir }));
+        yield* seedQuestion(first.engine);
+        for (let index = 0; index < 505; index++) {
+          yield* first.engine.dispatch({
+            type: "thread.activity.append",
+            commandId: CommandId.make(`noise:${index}`),
+            threadId: callbackThreadId,
+            createdAt: callbackNow,
+            activity: {
+              id: EventId.make(`noise:${index}`),
+              kind: "tool.completed",
+              tone: "info",
+              summary: "Tool finished",
+              payload: {},
+              turnId: null,
+              createdAt: callbackNow,
+            },
+          });
+        }
+        yield* first.drainEffect;
+        yield* first.dispose;
+        const restarted = yield* Effect.promise(() => createHarness({ persistent: true, baseDir }));
+        yield* restarted.engine.dispatch(answerCommand("answer-after-restart"));
+        yield* restarted.drainEffect;
+        expect(restarted.sendTurn).toHaveBeenCalledTimes(1);
+        expect(yield* restarted.pendingResponses()).toEqual([]);
+        yield* restarted.dispose;
+        const restartedAgain = yield* Effect.promise(() =>
+          createHarness({ persistent: true, baseDir }),
+        );
+        yield* restartedAgain.drainEffect;
+        expect(restartedAgain.sendTurn).not.toHaveBeenCalled();
+        yield* expectRejected(
+          restartedAgain.engine.dispatch(answerCommand("duplicate-after-second-restart")),
+          "no longer pending",
+        );
+      }),
+  );
 
   it("reacts to thread.turn.start by ensuring session and sending provider turn", async () => {
     const harness = await createHarness();
@@ -2653,50 +3328,75 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
-  it("reacts to thread.user-input.respond by forwarding structured user input answers", async () => {
-    const harness = await createHarness();
-    const now = "2026-01-01T00:00:00.000Z";
+  effectIt.effect(
+    "reacts to thread.user-input.respond by forwarding structured user input answers",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness());
+        const now = "2026-01-01T00:00:00.000Z";
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-for-user-input"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+        yield* harness.engine.dispatch({
+          type: "thread.activity.append",
+          commandId: CommandId.make("seed-input"),
           threadId: ThreadId.make("thread-1"),
-          status: "running",
-          providerName: "codex",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: now,
-        },
-        createdAt: now,
-      }),
-    );
+          createdAt: now,
+          activity: {
+            id: EventId.make("seed-input"),
+            kind: "user-input.requested",
+            tone: "info",
+            summary: "Question",
+            turnId: null,
+            createdAt: now,
+            payload: {
+              requestId: "user-input-request-1",
+              questions: [
+                {
+                  id: "sandbox_mode",
+                  header: "Sandbox",
+                  question: "Which mode should be used?",
+                  options: [],
+                },
+              ],
+            },
+          },
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-for-user-input"),
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+          createdAt: now,
+        });
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.user-input.respond",
-        commandId: CommandId.make("cmd-user-input-respond"),
-        threadId: ThreadId.make("thread-1"),
-        requestId: asApprovalRequestId("user-input-request-1"),
-        answers: {
-          sandbox_mode: "workspace-write",
-        },
-        createdAt: now,
-      }),
-    );
+        yield* harness.engine.dispatch({
+          type: "thread.user-input.respond",
+          commandId: CommandId.make("cmd-user-input-respond"),
+          threadId: ThreadId.make("thread-1"),
+          requestId: asApprovalRequestId("user-input-request-1"),
+          answers: {
+            sandbox_mode: "workspace-write",
+          },
+          createdAt: now,
+        });
 
-    await waitFor(() => harness.respondToUserInput.mock.calls.length === 1);
-    expect(harness.respondToUserInput.mock.calls[0]?.[0]).toEqual({
-      threadId: "thread-1",
-      requestId: "user-input-request-1",
-      answers: {
-        sandbox_mode: "workspace-write",
-      },
-    });
-  });
+        yield* harness.drainEffect;
+        expect(harness.respondToUserInput.mock.calls[0]?.[0]).toEqual({
+          threadId: "thread-1",
+          requestId: "user-input-request-1",
+          answers: {
+            sandbox_mode: "workspace-write",
+          },
+        });
+      }),
+  );
 
   it("surfaces stale provider approval request failures without faking approval resolution", async () => {
     const harness = await createHarness();
@@ -2793,114 +3493,104 @@ describe("ProviderCommandReactor", () => {
     expect(resolvedActivity).toBeUndefined();
   });
 
-  it("surfaces non-resumable provider user-input callbacks as stale failures", async () => {
-    const harness = await createHarness();
-    const now = "2026-01-01T00:00:00.000Z";
-    harness.respondToUserInput.mockImplementation(() =>
-      Effect.fail(
-        new ProviderAdapterRequestError({
-          provider: ProviderDriverKind.make("claudeAgent"),
-          method: "item/tool/respondToUserInput",
-          detail: "Unknown pending Codex user input request: user-input-request-1",
-        }),
-      ),
-    );
+  effectIt.effect(
+    "recovers lost provider callbacks with the saved question and actual answer",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness());
+        const now = "2026-01-01T00:00:00.000Z";
+        harness.respondToUserInput.mockImplementation(() =>
+          Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: ProviderDriverKind.make("claudeAgent"),
+              method: "item/tool/respondToUserInput",
+              detail: "Unknown pending Codex user input request: user-input-request-1",
+            }),
+          ),
+        );
 
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.session.set",
-        commandId: CommandId.make("cmd-session-set-for-user-input-error"),
-        threadId: ThreadId.make("thread-1"),
-        session: {
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-set-for-user-input-error"),
           threadId: ThreadId.make("thread-1"),
-          status: "running",
-          providerName: "claudeAgent",
-          runtimeMode: "approval-required",
-          activeTurnId: null,
-          lastError: null,
-          updatedAt: now,
-        },
-        createdAt: now,
-      }),
-    );
-
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.activity.append",
-        commandId: CommandId.make("cmd-user-input-requested"),
-        threadId: ThreadId.make("thread-1"),
-        activity: {
-          id: EventId.make("activity-user-input-requested"),
-          tone: "info",
-          kind: "user-input.requested",
-          summary: "User input requested",
-          payload: {
-            requestId: "user-input-request-1",
-            questions: [
-              {
-                id: "sandbox_mode",
-                header: "Sandbox",
-                question: "Which mode should be used?",
-                options: [
-                  {
-                    label: "workspace-write",
-                    description: "Allow workspace writes only",
-                  },
-                ],
-              },
-            ],
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "claudeAgent",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
           },
-          turnId: null,
           createdAt: now,
-        },
-        createdAt: now,
+        });
+
+        yield* harness.engine.dispatch({
+          type: "thread.activity.append",
+          commandId: CommandId.make("cmd-user-input-requested"),
+          threadId: ThreadId.make("thread-1"),
+          activity: {
+            id: EventId.make("activity-user-input-requested"),
+            tone: "info",
+            kind: "user-input.requested",
+            summary: "User input requested",
+            payload: {
+              requestId: "user-input-request-1",
+              questions: [
+                {
+                  id: "sandbox_mode",
+                  header: "Sandbox",
+                  question: "Which mode should be used?",
+                  options: [
+                    {
+                      label: "workspace-write",
+                      description: "Allow workspace writes only",
+                    },
+                  ],
+                },
+              ],
+            },
+            turnId: null,
+            createdAt: now,
+          },
+          createdAt: now,
+        });
+
+        yield* harness.engine.dispatch({
+          type: "thread.user-input.respond",
+          commandId: CommandId.make("cmd-user-input-respond-stale"),
+          threadId: ThreadId.make("thread-1"),
+          requestId: asApprovalRequestId("user-input-request-1"),
+          answers: {
+            sandbox_mode: "workspace-write",
+          },
+          createdAt: now,
+        });
+
+        yield* harness.drainEffect;
+        const readModel = yield* harness.readModelEffect;
+        const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+        expect(
+          thread?.activities.some(
+            (activity) => activity.kind === "provider.user-input.respond.failed",
+          ),
+        ).toBe(false);
+        expect(
+          thread?.activities.find((activity) => activity.kind === "user-input.resolved")?.payload,
+        ).toMatchObject({
+          requestId: "user-input-request-1",
+          deliveryMode: "conversation-recovery",
+          answers: { sandbox_mode: "workspace-write" },
+        });
+        expect(thread?.messages.find((message) => message.role === "user")?.text).toContain(
+          "Which mode should be used?",
+        );
+        expect(thread?.messages.find((message) => message.role === "user")?.text).toContain(
+          "workspace-write",
+        );
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
       }),
-    );
-
-    await Effect.runPromise(
-      harness.engine.dispatch({
-        type: "thread.user-input.respond",
-        commandId: CommandId.make("cmd-user-input-respond-stale"),
-        threadId: ThreadId.make("thread-1"),
-        requestId: asApprovalRequestId("user-input-request-1"),
-        answers: {
-          sandbox_mode: "workspace-write",
-        },
-        createdAt: now,
-      }),
-    );
-
-    await waitFor(async () => {
-      const readModel = await harness.readModel();
-      const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
-      if (!thread) return false;
-      return thread.activities.some(
-        (activity) => activity.kind === "provider.user-input.respond.failed",
-      );
-    });
-
-    const readModel = await harness.readModel();
-    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
-    expect(thread).toBeDefined();
-
-    const failureActivity = thread?.activities.find(
-      (activity) => activity.kind === "provider.user-input.respond.failed",
-    );
-    expect(failureActivity).toBeDefined();
-    expect(failureActivity?.payload).toMatchObject({
-      requestId: "user-input-request-1",
-      detail: expect.stringContaining("Stale pending user-input request: user-input-request-1"),
-    });
-
-    const resolvedActivity = thread?.activities.find(
-      (activity) =>
-        activity.kind === "user-input.resolved" &&
-        typeof activity.payload === "object" &&
-        activity.payload !== null &&
-        (activity.payload as Record<string, unknown>).requestId === "user-input-request-1",
-    );
-    expect(resolvedActivity).toBeUndefined();
-  });
+  );
 
   it("reacts to thread.session.stop by stopping provider session and clearing thread session state", async () => {
     const harness = await createHarness();

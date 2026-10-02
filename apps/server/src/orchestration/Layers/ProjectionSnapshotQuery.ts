@@ -1,4 +1,5 @@
 import {
+  ApprovalRequestId,
   ChatAttachment,
   CheckpointRef,
   IsoDateTime,
@@ -558,6 +559,88 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         ORDER BY thread_id ASC, created_at ASC, plan_id ASC
       `,
   });
+
+  const userInputActivityRows = SqlSchema.findAll({
+    Request: Schema.Struct({ threadId: ThreadId, requestId: ApprovalRequestId }),
+    Result: ProjectionThreadActivityDbRowSchema,
+    execute: ({ threadId, requestId }) => sql`
+      SELECT json_extract(e.payload_json, '$.activity.id') AS "activityId", e.stream_id AS "threadId",
+        json_extract(e.payload_json, '$.activity.turnId') AS "turnId",
+        json_extract(e.payload_json, '$.activity.tone') AS tone,
+        json_extract(e.payload_json, '$.activity.kind') AS kind,
+        json_extract(e.payload_json, '$.activity.summary') AS summary,
+        json_extract(e.payload_json, '$.activity.payload') AS payload,
+        e.sequence, json_extract(e.payload_json, '$.activity.createdAt') AS "createdAt"
+      FROM orchestration_events e
+      WHERE e.stream_id = ${threadId} AND e.event_type = 'thread.activity-appended'
+        AND json_extract(e.metadata_json, '$.requestId') = ${requestId}
+        AND (json_extract(e.payload_json, '$.activity.kind') LIKE 'user-input.%'
+          OR json_extract(e.payload_json, '$.activity.kind') = 'provider.user-input.respond.failed')
+        AND (json_extract(e.payload_json, '$.activity.kind') != 'user-input.requested' OR NOT EXISTS (
+          SELECT 1 FROM orchestration_events newer WHERE newer.aggregate_kind = 'thread' AND newer.stream_id = ${threadId}
+            AND newer.event_type IN ('thread.turn-start-requested', 'thread.reverted')
+            AND newer.sequence > (SELECT MAX(question.sequence) FROM orchestration_events question
+              WHERE question.stream_id = ${threadId} AND question.event_type = 'thread.activity-appended'
+                AND json_extract(question.metadata_json, '$.requestId') = ${requestId}
+                AND json_extract(question.payload_json, '$.activity.kind') = 'user-input.requested')
+        ))
+      ORDER BY e.sequence ASC
+    `,
+  });
+
+  const pendingUserInputResponseRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionThreadActivityDbRowSchema,
+    execute: () => sql`
+      SELECT a.activity_id AS "activityId", a.thread_id AS "threadId", a.turn_id AS "turnId",
+        a.tone, a.kind, a.summary, a.payload_json AS "payload", a.sequence, a.created_at AS "createdAt"
+      FROM projection_thread_activities a JOIN projection_threads t ON t.thread_id = a.thread_id
+      WHERE a.kind = 'user-input.response-claimed' AND t.deleted_at IS NULL AND t.archived_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM projection_thread_activities b
+          WHERE b.thread_id = a.thread_id
+            AND json_extract(b.payload_json, '$.requestActivityId') = json_extract(a.payload_json, '$.requestActivityId')
+            AND b.kind IN ('user-input.resolved', 'provider.user-input.respond.failed'))
+      ORDER BY a.sequence ASC
+    `,
+  });
+  const userInputActivity = (
+    row: typeof ProjectionThreadActivityDbRowSchema.Type,
+  ): OrchestrationThreadActivity => ({
+    id: row.activityId,
+    tone: row.tone,
+    kind: row.kind,
+    summary: row.summary,
+    payload: row.payload,
+    turnId: row.turnId,
+    createdAt: row.createdAt,
+    ...(row.sequence !== null ? { sequence: row.sequence } : {}),
+  });
+  const getUserInputActivities: ProjectionSnapshotQueryShape["getUserInputActivities"] = (
+    threadId,
+    requestId,
+  ) =>
+    userInputActivityRows({ threadId, requestId }).pipe(
+      Effect.map((rows) => rows.map(userInputActivity)),
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.userInput:query",
+          "ProjectionSnapshotQuery.userInput:decode",
+        ),
+      ),
+    );
+  const getPendingUserInputResponses: ProjectionSnapshotQueryShape["getPendingUserInputResponses"] =
+    () =>
+      pendingUserInputResponseRows(undefined).pipe(
+        Effect.map((rows) =>
+          rows.map((row) => ({ threadId: row.threadId, activity: userInputActivity(row) })),
+        ),
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionSnapshotQuery.pendingUserInput:query",
+            "ProjectionSnapshotQuery.pendingUserInput:decode",
+          ),
+        ),
+      );
 
   const listThreadActivityRows = SqlSchema.findAll({
     Request: Schema.Void,
@@ -2812,6 +2895,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       );
 
   return {
+    getUserInputActivities,
+    getPendingUserInputResponses,
     getCommandReadModel,
     getSnapshot,
     getShellSnapshot,

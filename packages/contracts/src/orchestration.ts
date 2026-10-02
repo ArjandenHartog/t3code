@@ -838,6 +838,9 @@ export const ThreadTurnStartCommand = Schema.Struct({
   interactionMode: ProviderInteractionMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
   ),
+  userInputRecovery: Schema.optional(
+    Schema.Struct({ requestId: ApprovalRequestId, requestActivityId: EventId }),
+  ),
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   createdAt: IsoDateTime,
@@ -1271,6 +1274,8 @@ export const ThreadApprovalResponseRequestedPayload = Schema.Struct({
 });
 
 const ThreadUserInputResponseRequestedPayload = Schema.Struct({
+  requestActivityId: Schema.optional(EventId),
+  modelSelection: Schema.optional(ModelSelection),
   threadId: ThreadId,
   requestId: ApprovalRequestId,
   answers: ProviderUserInputAnswers,

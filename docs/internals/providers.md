@@ -90,3 +90,20 @@ when a request opens (approval) or user input is requested, via
 [ingest]: ../../apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.ts
 [cmd]: ../../apps/server/src/orchestration/Layers/ProviderCommandReactor.ts
 [checkpoint]: ../../apps/server/src/orchestration/Layers/CheckpointReactor.ts
+
+### Durable user-input delivery
+
+User-input responses are validated against request-specific persisted activities, read in
+orchestration event order rather than provider-local activity order. The lookup has a partial
+request index and is independent of the retained detail timeline. The serialized command decider
+persists a `user-input.response-claimed` activity and its response intent in one transaction.
+That claim binds the answer to the question activity and selected model; another device cannot
+accept a second answer with a different command id. Ambiguous reused request ids are rejected.
+
+The provider command reactor records delivery attempts before invoking callbacks. At startup it
+restores unfinished claims for active threads. A definitively missing callback permits a deterministic
+continuation command containing the original question and actual answer; the decider rechecks that
+the question is still current before committing that turn. Native resolutions can reconcile an
+interrupted receipt. An attempt with no confirmed outcome is surfaced as uncertain and is never
+blindly replayed. This provides durable acceptance and duplicate suppression, rather than claiming
+exactly-once execution across arbitrary provider crashes. Permission approvals remain separate.

@@ -1,9 +1,10 @@
 import {
   type ChatAttachment,
+  MessageId,
+  OrchestrationEvent,
   CommandId,
   EventId,
   type ModelSelection,
-  type OrchestrationEvent,
   ProviderDriverKind,
   type ProjectId,
   type OrchestrationSession,
@@ -16,6 +17,7 @@ import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shar
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -46,8 +48,11 @@ import {
 } from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
+import { findUserInputRequest, userInputRecoveryText } from "../userInputRecovery.ts";
+
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
+const decodeOrchestrationEvent = Schema.decodeUnknownOption(OrchestrationEvent);
 
 type ProviderIntentEvent = Extract<
   OrchestrationEvent,
@@ -1243,44 +1248,161 @@ const make = Effect.gen(function* () {
     function* (
       event: Extract<ProviderIntentEvent, { type: "thread.user-input-response-requested" }>,
     ) {
-      const thread = yield* resolveThread(event.payload.threadId);
-      if (!thread) {
+      const { threadId, requestId, requestActivityId, answers } = event.payload;
+      const createdAt = DateTime.formatIso(yield* DateTime.now);
+      // Old intents have no durable claim and are deliberately not replayed.
+      if (requestActivityId === undefined) return;
+      const thread = yield* resolveThread(threadId);
+      if (!thread || thread.archivedAt !== null) return;
+      const activities = yield* projectionSnapshotQuery.getUserInputActivities(threadId, requestId);
+      const related = activities.filter((activity) => {
+        const payload = activity.payload;
+        return (
+          typeof payload === "object" &&
+          payload !== null &&
+          "requestActivityId" in payload &&
+          payload.requestActivityId === requestActivityId
+        );
+      });
+      if (
+        related.some(
+          (activity) =>
+            activity.kind === "user-input.resolved" ||
+            activity.kind === "provider.user-input.respond.failed",
+        )
+      )
+        return;
+      const request = findUserInputRequest(activities, requestId);
+      const record = (
+        kind: string,
+        summary: string,
+        payload: Readonly<Record<string, unknown>> = {},
+        tone: "info" | "error" = "info",
+      ) =>
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId: CommandId.make(`server:user-input:${event.eventId}:${kind}`),
+          threadId,
+          createdAt,
+          activity: {
+            id: EventId.make(`user-input:${event.eventId}:${kind}`),
+            kind,
+            summary,
+            tone,
+            turnId: request?.activity.turnId ?? null,
+            createdAt,
+            payload: { requestId, requestActivityId, ...payload },
+          },
+        });
+      const fail = (detail: string) =>
+        record(
+          "provider.user-input.respond.failed",
+          "User input answer could not be delivered",
+          { detail },
+          "error",
+        );
+      if (
+        !request ||
+        request.activity.id !== requestActivityId ||
+        (request.activity.turnId !== null &&
+          thread.latestTurn !== null &&
+          request.activity.turnId !== thread.latestTurn.turnId)
+      ) {
+        return yield* fail(
+          "Stale pending user-input request: a newer turn replaced this question. The saved answer was not sent.",
+        );
+      }
+      if (
+        event.payload.modelSelection !== undefined &&
+        !Equal.equals(event.payload.modelSelection, thread.modelSelection)
+      ) {
+        return yield* fail(
+          "Stale pending user-input request: the selected provider or model changed before delivery. Your answer is saved; start a new turn.",
+        );
+      }
+      if (
+        activities.some(
+          (activity) =>
+            activity.kind === "user-input.resolved" &&
+            (activity.sequence ?? 0) > (request.activity.sequence ?? 0),
+        )
+      ) {
+        yield* record("user-input.resolved", "Provider already received the saved answer", {
+          answers,
+          deliveryMode: "native-callback",
+        });
         return;
       }
-      const hasSession = thread.session && thread.session.status !== "stopped";
-      if (!hasSession) {
-        return yield* appendProviderFailureActivity({
-          threadId: event.payload.threadId,
-          kind: "provider.user-input.respond.failed",
-          summary: "Provider user input response failed",
-          detail: "No active provider session is bound to this thread.",
-          turnId: null,
-          createdAt: event.payload.createdAt,
-          requestId: event.payload.requestId,
-        });
+      const nativeStarted = related.some(
+        (activity) => activity.kind === "user-input.delivery.started",
+      );
+      const callbackUnavailable = related.some(
+        (activity) => activity.kind === "user-input.callback-unavailable",
+      );
+      const recoveryStarted = related.some(
+        (activity) => activity.kind === "user-input.recovery.started",
+      );
+      if (recoveryStarted || (nativeStarted && !callbackUnavailable)) {
+        return yield* fail(
+          "Stale pending user-input request: delivery was interrupted and its outcome is unknown. Your answer is saved. Check the conversation before explicitly continuing; T3 did not resend it.",
+        );
       }
-
-      yield* providerService
-        .respondToUserInput({
-          threadId: event.payload.threadId,
-          requestId: event.payload.requestId,
-          answers: event.payload.answers,
+      if (!callbackUnavailable && thread.session && thread.session.status !== "stopped") {
+        yield* record("user-input.delivery.started", "Delivering user input answer");
+        const result = yield* providerService
+          .respondToUserInput({ threadId, requestId, answers })
+          .pipe(Effect.exit);
+        if (result._tag === "Success") {
+          yield* record("user-input.resolved", "User input answer delivered", {
+            answers,
+            deliveryMode: "native-callback",
+          });
+          return;
+        }
+        if (Cause.hasInterruptsOnly(result.cause)) return yield* Effect.interrupt;
+        if (!isUnknownPendingUserInputRequestError(result.cause)) {
+          return yield* fail(
+            `Stale pending user-input request: delivery failed and its outcome may be unknown. Your answer is saved; check the conversation before continuing. ${Cause.pretty(result.cause)}`,
+          );
+        }
+        yield* record(
+          "user-input.callback-unavailable",
+          "Restoring answer from the saved question",
+        );
+      }
+      // Only a definitively missing callback may become a new conversation turn.
+      // Persist the attempt before dispatch: after an uncertain interruption we
+      // never blindly repeat a provider call or a continuation turn.
+      yield* record("user-input.recovery.started", "Queuing recovered user input answer");
+      yield* orchestrationEngine
+        .dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(`server:user-input-recovery:${requestActivityId}`),
+          threadId,
+          message: {
+            messageId: MessageId.make(`user-input-recovery:${requestActivityId}`),
+            role: "user",
+            text: userInputRecoveryText(request.questions, answers),
+            attachments: [],
+          },
+          userInputRecovery: { requestId, requestActivityId },
+          modelSelection: thread.modelSelection,
+          runtimeMode: thread.runtimeMode,
+          interactionMode: thread.interactionMode,
+          createdAt,
         })
         .pipe(
-          Effect.catchCause((cause) =>
-            appendProviderFailureActivity({
-              threadId: event.payload.threadId,
-              kind: "provider.user-input.respond.failed",
-              summary: "Provider user input response failed",
-              detail: isUnknownPendingUserInputRequestError(cause)
-                ? stalePendingRequestDetail("user-input", event.payload.requestId)
-                : Cause.pretty(cause),
-              turnId: null,
-              createdAt: event.payload.createdAt,
-              requestId: event.payload.requestId,
-            }),
-          ),
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt;
+            return fail(
+              `Stale pending user-input request: recovery was not queued. Your answer is saved. ${Cause.pretty(cause)}`,
+            ).pipe(Effect.andThen(Effect.failCause(cause)));
+          }),
         );
+      yield* record("user-input.resolved", "Recovered answer queued as a continuation", {
+        answers,
+        deliveryMode: "conversation-recovery",
+      });
     },
   );
 
@@ -1404,6 +1526,36 @@ const make = Effect.gen(function* () {
 
     yield* forkParked(Stream.runForEach(orchestrationEngine.streamDomainEvents, processEvent));
 
+    // Claims are persisted atomically with response intents. Rehydrate only
+    // those claims, rather than replaying historical failed callbacks.
+    const pendingResponses = yield* projectionSnapshotQuery.getPendingUserInputResponses().pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("Failed to restore pending user input answers", {
+              cause: Cause.pretty(cause),
+            }).pipe(Effect.as([])),
+      ),
+    );
+    const restorePendingResponses = Effect.gen(function* () {
+      for (const { activity } of pendingResponses) {
+        const payload = activity.payload;
+        if (typeof payload !== "object" || payload === null || !("response" in payload)) continue;
+        const recovered = decodeOrchestrationEvent({
+          ...(typeof payload.response === "object" && payload.response !== null
+            ? payload.response
+            : {}),
+          sequence: activity.sequence ?? 0,
+        });
+        if (
+          Option.isSome(recovered) &&
+          recovered.value.type === "thread.user-input-response-requested"
+        ) {
+          yield* worker.enqueue(recovered.value);
+        }
+      }
+    });
+
     // The domain event stream is hot, so work pending before this reactor
     // starts cannot be resumed. Correlated completions only clear the request
     // captured here, leaving any newer request untouched.
@@ -1424,9 +1576,10 @@ const make = Effect.gen(function* () {
     );
     const activation = yield* ServerActivation;
     if (activation === undefined) {
+      yield* restorePendingResponses;
       yield* clearInterrupted;
     } else {
-      yield* forkParked(clearInterrupted);
+      yield* forkParked(restorePendingResponses.pipe(Effect.andThen(clearInterrupted)));
     }
   });
 

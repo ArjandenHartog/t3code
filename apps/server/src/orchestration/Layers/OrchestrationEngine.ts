@@ -167,9 +167,29 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           });
         }
 
+        let decisionReadModel = commandReadModel;
+        const command = envelope.command;
+        const userInputRequestId =
+          command.type === "thread.user-input.respond"
+            ? command.requestId
+            : command.type === "thread.turn.start"
+              ? command.userInputRecovery?.requestId
+              : undefined;
+        if (userInputRequestId !== undefined && "threadId" in command) {
+          const activities = yield* projectionSnapshotQuery.getUserInputActivities(
+            command.threadId,
+            userInputRequestId,
+          );
+          decisionReadModel = {
+            ...commandReadModel,
+            threads: commandReadModel.threads.map((thread) =>
+              thread.id === command.threadId ? { ...thread, activities } : thread,
+            ),
+          };
+        }
         const eventBase = yield* decideOrchestrationCommand({
           command: envelope.command,
-          readModel: commandReadModel,
+          readModel: decisionReadModel,
         }).pipe(
           Effect.provideService(Crypto.Crypto, crypto),
           Effect.mapError((cause) =>

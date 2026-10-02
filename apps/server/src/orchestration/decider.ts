@@ -7,6 +7,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Equal from "effect/Equal";
 import type * as PlatformError from "effect/PlatformError";
 
 import { OrchestrationCommandInvariantError } from "./Errors.ts";
@@ -21,6 +22,7 @@ import {
   requireThreadNotArchived,
 } from "./commandInvariants.ts";
 import { projectEvent } from "./projector.ts";
+import { findUserInputRequest } from "./userInputRecovery.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -929,6 +931,31 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      if (command.userInputRecovery !== undefined) {
+        const request = findUserInputRequest(
+          targetThread.activities,
+          command.userInputRecovery.requestId,
+        );
+        if (
+          !request ||
+          request.activity.id !== command.userInputRecovery.requestActivityId ||
+          targetThread.archivedAt !== null ||
+          !Equal.equals(command.modelSelection, targetThread.modelSelection) ||
+          command.runtimeMode !== targetThread.runtimeMode ||
+          command.interactionMode !== targetThread.interactionMode ||
+          targetThread.activities.some(
+            (activity) =>
+              activity.kind === "user-input.resolved" &&
+              (activity.sequence ?? 0) > (request.activity.sequence ?? 0),
+          )
+        ) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail:
+              "The saved user-input question was replaced or resolved before recovery could start.",
+          });
+        }
+      }
       const sourceProposedPlan = command.sourceProposedPlan;
       const sourceThread = sourceProposedPlan
         ? yield* requireThread({
@@ -1085,29 +1112,125 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.user-input.respond": {
-      yield* requireThread({
+      const thread = yield* requireThreadNotArchived({
         readModel,
         command,
         threadId: command.threadId,
       });
-      return {
+      const request = findUserInputRequest(thread.activities, command.requestId);
+      const invalid = (detail: string) =>
+        new OrchestrationCommandInvariantError({ commandType: command.type, detail });
+      if (!request)
+        return yield* invalid("This user-input question is no longer pending in this thread.");
+      if (
+        thread.activities.filter((activity) => activity.kind === "user-input.requested").length > 1
+      ) {
+        return yield* invalid(
+          "The provider reused this question id. Start a new turn rather than answering an ambiguous question.",
+        );
+      }
+      const afterRequest = thread.activities.filter(
+        (activity) => (activity.sequence ?? 0) > (request.activity.sequence ?? 0),
+      );
+      if (
+        afterRequest.some(
+          (activity) =>
+            activity.kind === "user-input.response-claimed" ||
+            activity.kind === "user-input.resolved",
+        )
+      ) {
+        return yield* invalid("An answer to this user-input question has already been accepted.");
+      }
+      if (
+        afterRequest.some(
+          (activity) =>
+            activity.kind === "provider.user-input.respond.failed" &&
+            isStaleRequestFailureDetail(
+              typeof activity.payload === "object" && activity.payload !== null
+                ? (activity.payload as Record<string, unknown>)
+                : null,
+            ),
+        )
+      ) {
+        return yield* invalid("This user-input callback is stale. Start a new turn.");
+      }
+      if (
+        request.activity.turnId !== null &&
+        thread.latestTurn !== null &&
+        request.activity.turnId !== thread.latestTurn.turnId
+      ) {
+        return yield* invalid("This user-input question belongs to an older turn.");
+      }
+      if (
+        request.providerInstanceId !== undefined &&
+        request.providerInstanceId !== thread.modelSelection.instanceId
+      ) {
+        return yield* invalid("The provider for this question has changed. Start a new turn.");
+      }
+      const questionIds = new Set(request.questions.map((question) => question.id));
+      const hasAnswer = (value: unknown) =>
+        typeof value === "string"
+          ? value.trim().length > 0
+          : Array.isArray(value) &&
+            value.length > 0 &&
+            value.every((entry) => typeof entry === "string" && entry.trim().length > 0);
+      if (
+        questionIds.size === 0 ||
+        questionIds.size !== request.questions.length ||
+        Object.keys(command.answers).some((id) => !questionIds.has(id)) ||
+        request.questions.some((question) => !hasAnswer(command.answers[question.id]))
+      ) {
+        return yield* invalid(
+          "Answer every question using a non-empty answer for its original question id.",
+        );
+      }
+      const response = {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
           occurredAt: command.createdAt,
           commandId: command.commandId,
-          metadata: {
-            requestId: command.requestId,
-          },
+          metadata: { requestId: command.requestId },
         })),
-        type: "thread.user-input-response-requested",
+        type: "thread.user-input-response-requested" as const,
         payload: {
           threadId: command.threadId,
           requestId: command.requestId,
+          requestActivityId: request.activity.id,
           answers: command.answers,
+          modelSelection: thread.modelSelection,
           createdAt: command.createdAt,
         },
       };
+      return [
+        {
+          ...(yield* withEventBase({
+            aggregateKind: "thread",
+            aggregateId: command.threadId,
+            occurredAt: command.createdAt,
+            commandId: command.commandId,
+            metadata: { requestId: command.requestId },
+          })),
+          type: "thread.activity-appended" as const,
+          payload: {
+            threadId: command.threadId,
+            activity: {
+              id: EventId.make(`user-input-claim:${response.eventId}`),
+              kind: "user-input.response-claimed",
+              tone: "info" as const,
+              summary: "User input answer accepted",
+              turnId: request.activity.turnId,
+              createdAt: command.createdAt,
+              payload: {
+                requestId: command.requestId,
+                requestActivityId: request.activity.id,
+                response,
+              },
+            },
+          },
+        },
+        response,
+      ];
     }
 
     case "thread.checkpoint.revert": {

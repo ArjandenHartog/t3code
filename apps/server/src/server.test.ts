@@ -780,6 +780,8 @@ const buildAppUnderTest = (options?: {
       ),
       Layer.provide(
         Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+          getUserInputActivities: () => Effect.die("unexpected user input lookup"),
+          getPendingUserInputResponses: () => Effect.die("unexpected user input recovery"),
           getCommandReadModel: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
           getSnapshot: () => Effect.succeed(makeDefaultOrchestrationReadModel()),
           getShellSnapshot: () =>

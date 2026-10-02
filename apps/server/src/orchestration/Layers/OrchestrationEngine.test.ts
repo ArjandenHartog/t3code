@@ -176,6 +176,8 @@ describe("OrchestrationEngine", () => {
     const layer = OrchestrationEngineLive.pipe(
       Layer.provide(
         Layer.succeed(ProjectionSnapshotQuery, {
+          getUserInputActivities: () => Effect.die("unexpected user input lookup"),
+          getPendingUserInputResponses: () => Effect.die("unexpected user input recovery"),
           getCommandReadModel: () => Effect.succeed(commandReadModel),
           getSnapshot: () =>
             Effect.sync(() => {

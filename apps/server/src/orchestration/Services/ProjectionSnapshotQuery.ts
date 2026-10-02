@@ -7,6 +7,8 @@
  * @module ProjectionSnapshotQuery
  */
 import type {
+  ApprovalRequestId,
+  OrchestrationThreadActivity,
   CheckpointRef,
   OrchestrationCheckpointSummary,
   OrchestrationProject,
@@ -58,6 +60,17 @@ export interface ProjectionFullThreadDiffContext {
  * ProjectionSnapshotQueryShape - Service API for read-model snapshots.
  */
 export interface ProjectionSnapshotQueryShape {
+  /** Read one request in durable event order; omit questions superseded by a turn or revert. */
+  readonly getUserInputActivities: (
+    threadId: ThreadId,
+    requestId: ApprovalRequestId,
+  ) => Effect.Effect<ReadonlyArray<OrchestrationThreadActivity>, ProjectionRepositoryError>;
+  /** Read unfinished durable response claims for active, unarchived threads. */
+  readonly getPendingUserInputResponses: () => Effect.Effect<
+    ReadonlyArray<{ readonly threadId: ThreadId; readonly activity: OrchestrationThreadActivity }>,
+    ProjectionRepositoryError
+  >;
+
   /**
    * Read the lightweight command snapshot used to bootstrap the in-memory
    * orchestration engine without hydrating message/activity/checkpoint bodies.

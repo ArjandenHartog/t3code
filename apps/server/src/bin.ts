@@ -1,11 +1,10 @@
 /**
  * Every ACP agent spawns `t3 acp-mcp-bridge` while opening its session, and terminal-fallback
  * agents run `t3 acp-mcp-call` per tool call, so their startup sits on first-message latency.
- * They and standalone version probes dispatch before the full CLI module graph loads;
- * everything else defers to the real CLI in ./binCli.ts.
+ * Both dispatch here before the full CLI module graph (seconds of evaluation) loads; everything
+ * else defers to the real CLI in ./binCli.ts.
  */
 import { isEntrypoint } from "./entrypoint.ts";
-import packageJson from "../package.json" with { type: "json" };
 
 if (
   isEntrypoint({
@@ -15,9 +14,7 @@ if (
   })
 ) {
   const command = process.argv[2];
-  if (command === "--version" && process.argv.length === 3) {
-    process.stdout.write(`t3 v${packageJson.version}\n`);
-  } else if (command === "acp-mcp-bridge" || command === "acp-mcp-call") {
+  if (command === "acp-mcp-bridge" || command === "acp-mcp-call") {
     const { runAcpMcpCliFastPath } = await import("./mcp/AcpMcpStdioBridge.ts");
     await runAcpMcpCliFastPath(command, process.argv.slice(3));
   } else {

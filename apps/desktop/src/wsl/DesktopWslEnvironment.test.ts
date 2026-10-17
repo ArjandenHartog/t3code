@@ -12,10 +12,9 @@ import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
 
 import {
+  buildWslProviderPathScript,
   buildWslRuntimeInstallScript,
-  buildWslRuntimeInvalidateScript,
   buildWslRuntimePruneScript,
-  buildWslRuntimeProbeScript,
   DesktopWslDistroListError,
   formatMissingToolsReason,
   parseNodePath,
@@ -165,7 +164,6 @@ describe("WSL runtime cache", () => {
       (id: string) => buildWslRuntimeInstallScript("/runtime.tar.gz", id, "b".repeat(64)),
     ],
     ["prune", buildWslRuntimePruneScript],
-    ["invalidate", buildWslRuntimeInvalidateScript],
   ] as const)("sanitizes cache ids in the %s script", (_, buildScript) => {
     const runtimeId = "1.2.3/x64; touch /tmp/nope";
     const script = buildScript(runtimeId);
@@ -182,7 +180,7 @@ describe("WSL runtime cache", () => {
 
     expect(script).toContain('runtime_parent="$HOME/.t3/wsl-runtime"');
     expect(script).toContain('  [ -f "$ready_marker" ] &&');
-    expect(script).toContain('    runtime_entry_runs "$runtime_root" &&');
+    expect(script).toContain('  runtime_entry_runs "$runtime_root" &');
     expect(script).toContain("if runtime_is_ready; then");
     expect(script).not.toContain("bin.mjs");
     expect(script).not.toContain("node-pty");
@@ -197,7 +195,7 @@ describe("WSL runtime cache", () => {
     expect(script).toContain(
       "tar -xzf '/mnt/c/Program Files/T3 Code/wsl-runtime.tar.gz' -C \"$runtime_tmp\" --strip-components=1",
     );
-    expect(script).toContain('if ! runtime_entry_runs "$runtime_tmp"; then');
+    expect(script).toContain('if ! wait "$runtime_check_pid"; then');
     expect(script).toContain('mv -T "$runtime_tmp" "$runtime_root"');
     expect(script).not.toContain('rm -rf "$runtime_root"');
 
@@ -280,10 +278,8 @@ describe("WSL runtime cache", () => {
     );
 
     expect(script).toContain(`  sha256sum "$1/t3" 2>/dev/null | cut -d ' ' -f 1`);
-    expect(script).toContain(
-      '    [ "$recorded_entry_digest" = "$(runtime_server_entry_digest "$runtime_root")" ]',
-    );
-    expect(script).toContain('    [ -n "$recorded_entry_digest" ] &&');
+    expect(script).toContain('  [ "$recorded_entry_digest" = "$current_entry_digest" ]');
+    expect(script).toContain('  [ -n "$recorded_entry_digest" ] || return 1');
     expect(script).toContain(
       `printf '%s\\n' "$installed_entry_digest" > "$runtime_tmp/.t3code-wsl-runtime-ready"`,
     );
@@ -306,7 +302,7 @@ describe("WSL runtime cache", () => {
       "b".repeat(64),
     );
 
-    expect(script).toContain('if ! runtime_entry_runs "$runtime_tmp"; then');
+    expect(script).toContain('if ! wait "$runtime_check_pid"; then');
 
     const payloadValidated = script.indexOf('runtime_entry_runs "$runtime_tmp"');
     const markerWritten = script.indexOf('> "$runtime_tmp/.t3code-wsl-runtime-ready"');
@@ -357,13 +353,6 @@ describe("WSL runtime cache", () => {
     );
     expect(script).toContain('find "$scratch" -maxdepth 0 -mmin +120');
   });
-
-  it("invalidates a cache by dropping its ready marker, not the tree", () => {
-    const script = buildWslRuntimeInvalidateScript("1.2.3/x64");
-
-    expect(script).toContain('rm -f "$HOME/.t3/wsl-runtime/1.2.3_x64/.t3code-wsl-runtime-ready"');
-    expect(script).not.toContain("rm -rf");
-  });
 });
 
 describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed)", () => {
@@ -374,14 +363,14 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
     fixtures.length = 0;
   });
 
-  const createFixture = () => {
+  const createFixture = (serverEntrySource = SERVER_ENTRY_SOURCE) => {
     const result = runShell(
       [
         "set -eu",
         "work=$(mktemp -d)",
         'stage="$work/stage/t3-0.0.0-linux-x64"',
         'mkdir -p "$stage/node_modules/node-pty/build/Release" "$work/home"',
-        `printf '%s' ${sh(SERVER_ENTRY_SOURCE)} > "$stage/t3"`,
+        `printf '%s' ${sh(serverEntrySource)} > "$stage/t3"`,
         'chmod +x "$stage/t3"',
         `printf '%s' 'pty-native-payload' > "$stage/node_modules/node-pty/build/Release/pty.node"`,
         `tar -czf "$work/wsl-runtime.tar.gz" -C "$work/stage" t3-0.0.0-linux-x64`,
@@ -431,7 +420,7 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
         "  }",
         '  eval "$2"',
         "); }",
-        buildWslRuntimeProbeScript(fixture.runtimeRoot),
+        buildWslProviderPathScript(),
       ].join("\n"),
     );
 
@@ -476,7 +465,7 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
       [
         "bash() { return 127; }",
         'export PATH="/fixture/bin:/usr/bin:/bin"',
-        buildWslRuntimeProbeScript(fixture.runtimeRoot),
+        buildWslProviderPathScript(),
       ].join("\n"),
     );
 
@@ -526,6 +515,37 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
     expect(repaired.status, repaired.stderr).toBe(0);
     expect(parseWslRuntimeRoot(repaired.stdout)).toBe(fixture.runtimeRoot);
     expect(runShell(`cat ${sh(fixture.serverEntry)}`).stdout).toBe(SERVER_ENTRY_SOURCE);
+  });
+
+  it("does not promote an archive when its CLI validation fails", () => {
+    const fixture = createFixture("#!/bin/sh\nexit 23\n");
+
+    const installed = fixture.install();
+
+    expect(installed.status).not.toBe(0);
+    expect(installed.stderr).toContain("does not contain a working t3 executable");
+    expect(parseWslRuntimeRoot(installed.stdout)).toBeNull();
+    expect(runShell(`[ ! -e ${sh(fixture.runtimeRoot)} ]`).status).toBe(0);
+  });
+
+  it("does not promote a working executable whose digest cannot be read", () => {
+    const fixture = createFixture();
+    const installed = runShell(
+      [
+        "set -eu",
+        "real_sha=$(command -v sha256sum)",
+        `mkdir -p ${sh(`${fixture.work}/bin`)}`,
+        `printf '#!/bin/sh\\ncase "$1" in */t3) exit 1;; esac\\nexec %s "$@"\\n' "$real_sha" > ${sh(`${fixture.work}/bin/sha256sum`)}`,
+        `chmod +x ${sh(`${fixture.work}/bin/sha256sum`)}`,
+        `export PATH=${sh(`${fixture.work}/bin`)}:$PATH`,
+        fixture.installScript(),
+      ].join("\n"),
+    );
+
+    expect(installed.status).not.toBe(0);
+    expect(installed.stderr).toContain("Could not hash the WSL runtime server entry");
+    expect(parseWslRuntimeRoot(installed.stdout)).toBeNull();
+    expect(runShell(`[ ! -e ${sh(fixture.runtimeRoot)} ]`).status).toBe(0);
   });
 
   it("falls back instead of launching a corrupted cache it cannot reinstall", () => {

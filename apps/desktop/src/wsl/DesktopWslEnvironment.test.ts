@@ -262,7 +262,7 @@ describe("WSL runtime cache", () => {
       "b".repeat(64),
     );
 
-    expect(script).toContain('  [ -x "$1/t3" ] && "$1/t3" --version >/dev/null 2>&1');
+    expect(script).toContain('  [ -x "$1/t3" ] && "$1/t3" --help >/dev/null 2>&1');
 
     const entryCheckDefined = script.indexOf("runtime_entry_runs() {");
     const readinessDefined = script.indexOf("runtime_is_ready() {");
@@ -506,6 +506,26 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
     expect(parseWslRuntimeRoot(repaired.stdout)).toBe(fixture.runtimeRoot);
     const restored = runShell(`set -eu\ncat ${sh(fixture.serverEntry)}`);
     expect(restored.stdout).toBe(SERVER_ENTRY_SOURCE);
+  });
+
+  it("repairs a cache whose version prints but whose CLI cannot load", () => {
+    const fixture = createFixture();
+    expect(fixture.install().status).toBe(0);
+    const brokenEntry = '#!/bin/sh\n[ "$1" = "--version" ] && echo "t3 v0.0.0" && exit 0\nexit 1\n';
+    const broken = runShell(
+      [
+        "set -eu",
+        `printf '%s' ${sh(brokenEntry)} > ${sh(fixture.serverEntry)}`,
+        `sha256sum ${sh(fixture.serverEntry)} | cut -d ' ' -f 1 > ${sh(`${fixture.runtimeRoot}/.t3code-wsl-runtime-ready`)}`,
+      ].join("\n"),
+    );
+    expect(broken.status, broken.stderr).toBe(0);
+
+    const repaired = fixture.install();
+
+    expect(repaired.status, repaired.stderr).toBe(0);
+    expect(parseWslRuntimeRoot(repaired.stdout)).toBe(fixture.runtimeRoot);
+    expect(runShell(`cat ${sh(fixture.serverEntry)}`).stdout).toBe(SERVER_ENTRY_SOURCE);
   });
 
   it("falls back instead of launching a corrupted cache it cannot reinstall", () => {

@@ -48,12 +48,11 @@ describe("CLI entrypoint", () => {
     expect(result.stderr).toBe("");
   });
 
-  it("leaves version requests with extra arguments to the full CLI parser", () => {
-    const result = NodeChildProcess.spawnSync(
-      process.execPath,
-      [createCli(), "--version", "--help"],
-      { encoding: "utf8", timeout: 10_000 },
-    );
+  it.each([["--help"], ["--version", "--help"]])("loads the full CLI for %j", (...args) => {
+    const result = NodeChildProcess.spawnSync(process.execPath, [createCli(), ...args], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
 
     expect(result.error).toBeUndefined();
     expect(result.status).not.toBe(0);

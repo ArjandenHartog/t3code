@@ -274,7 +274,9 @@ export const buildWslRuntimeInstallScript = (
     `runtime_root="$runtime_parent/${safeRuntimeId}"`,
     `ready_marker="$runtime_root/${WSL_RUNTIME_READY_MARKER}"`,
     "runtime_entry_runs() {",
-    '  [ -x "$1/t3" ] && "$1/t3" --version >/dev/null 2>&1',
+    // --version skips CLI initialization; --help also verifies its external
+    // dependencies before the cache is reused or marked ready.
+    '  [ -x "$1/t3" ] && "$1/t3" --help >/dev/null 2>&1',
     "}",
     // Hashing the entry is what tells a working cache from one whose `t3` was
     // swapped or half-written after install: the file is still there and may

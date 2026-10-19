@@ -557,6 +557,45 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
     expect(restored.stdout).toBe(SERVER_ENTRY_SOURCE);
   });
 
+  it("stops validation before cleaning up an interrupted install and releases its lock", () => {
+    const fixture = createFixture(
+      [
+        "#!/bin/bash",
+        'if [ -z "${T3_TEST_CANCELLATION:-}" ]; then exit 0; fi',
+        'exec 7<> "$T3_TEST_CANCELLATION/gate"',
+        'printf "%s\\n" "$$" > "$T3_TEST_CANCELLATION/started"',
+        "read -r -t 5 signal <&7",
+      ].join("\n"),
+    );
+    const interrupted = runShell(
+      [
+        "set -eu",
+        `work=${sh(fixture.work)}`,
+        'mkfifo "$work/gate" "$work/started"',
+        'exec 7<> "$work/gate" 8<> "$work/started"',
+        "cat > \"$work/install.sh\" <<'T3CODE_INSTALL_SCRIPT'",
+        fixture.installScript(),
+        "T3CODE_INSTALL_SCRIPT",
+        'T3_TEST_CANCELLATION="$work" sh "$work/install.sh" > "$work/install.out" 2>&1 &',
+        "installer=$!",
+        // Release the fixture validator even when testing the broken implementation.
+        'trap \'printf "done\\n" >&7; wait "$installer" 2>/dev/null || true\' EXIT',
+        "read -r -t 5 validator <&8",
+        'kill -TERM "$installer"',
+        'if wait "$installer"; then exit 1; fi',
+        `flock -n ${sh(`${fixture.runtimeParent}/.${fixture.runtimeId}.install.lock`)} true`,
+        'test ! -e "/proc/$validator"',
+        `test ! -e ${sh(fixture.runtimeRoot)}`,
+        `test -z "$(find ${sh(fixture.runtimeParent)} -maxdepth 1 -type d -name '.*.tmp.*' -print -quit)"`,
+      ].join("\n"),
+    );
+
+    expect(interrupted.status, interrupted.stderr).toBe(0);
+    const retried = fixture.install();
+    expect(retried.status, retried.stderr).toBe(0);
+    expect(parseWslRuntimeRoot(retried.stdout)).toBe(fixture.runtimeRoot);
+  });
+
   it("repairs a cache whose version prints but whose CLI cannot load", () => {
     const fixture = createFixture();
     expect(fixture.install().status).toBe(0);

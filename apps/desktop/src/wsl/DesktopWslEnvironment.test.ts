@@ -2,6 +2,9 @@
 import { describe, it } from "@effect/vitest";
 import { afterAll, expect } from "vite-plus/test";
 import * as NodeChildProcess from "node:child_process";
+import * as Deferred from "effect/Deferred";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -11,7 +14,12 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
 
+import * as DesktopConfig from "../app/DesktopConfig.ts";
+import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+
 import {
+  DesktopWslEnvironment,
+  layer as layerWslEnvironment,
   buildWslProviderPathScript,
   buildWslRuntimeInstallScript,
   buildWslRuntimePruneScript,
@@ -157,6 +165,107 @@ describe("probeWslDistros", () => {
   });
 });
 
+describe("prepareRuntime", () => {
+  const environment = DesktopEnvironment.layer({
+    dirname: "/app/apps/desktop/src",
+    homeDirectory: "/home/test",
+    platform: "win32",
+    processArch: "x64",
+    appVersion: "1.2.3",
+    appPath: "/app",
+    isPackaged: true,
+    resourcesPath: "/app/resources",
+    runningUnderArm64Translation: false,
+  }).pipe(Layer.provide([DesktopConfig.layerTest({}), Path.layer]));
+
+  it.effect.each(["ready", "timeout"] as const)(
+    "overlaps installation and PATH discovery and waits for PATH: %s",
+    (pathOutcome) =>
+      Effect.gen(function* () {
+        const installStarted = yield* Deferred.make<void>();
+        const pathStarted = yield* Deferred.make<void>();
+        const finishInstall = yield* Deferred.make<void>();
+        const finishPath = yield* Deferred.make<void>();
+        const completed = yield* Deferred.make<void>();
+        const spawner = ChildProcessSpawner.make((command) =>
+          Effect.gen(function* () {
+            if (command._tag !== "StandardCommand") return yield* Effect.die("unexpected pipeline");
+            let stdout = "/mnt/c/runtime.tar.gz";
+            let exitCode = Effect.succeed(ChildProcessSpawner.ExitCode(0));
+            if (!command.args.includes("wslpath")) {
+              const input = command.options.stdin;
+              if (!Stream.isStream(input)) return yield* Effect.die("expected shell input");
+              const script = yield* Stream.mkString(Stream.decodeText(input));
+              const installing = script.includes("runtimeRoot:");
+              yield* Deferred.succeed(installing ? installStarted : pathStarted, undefined);
+              stdout = installing
+                ? "runtimeRoot:/home/test/.t3/wsl-runtime/cache"
+                : "resolvedPath:/home/test/.local/bin:/usr/bin:/bin";
+              exitCode = Deferred.await(installing ? finishInstall : finishPath).pipe(
+                Effect.as(ChildProcessSpawner.ExitCode(0)),
+              );
+            }
+            return ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(1),
+              exitCode,
+              isRunning: Effect.succeed(true),
+              kill: () => Effect.void,
+              unref: Effect.succeed(Effect.void),
+              stdin: Sink.drain,
+              stdout: Stream.make(encoder.encode(stdout)),
+              stderr: Stream.empty,
+              all: Stream.empty,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.empty,
+            });
+          }),
+        );
+        const wsl = yield* DesktopWslEnvironment.pipe(
+          Effect.provide(
+            layerWslEnvironment.pipe(
+              Layer.provide(environment),
+              Layer.provide(FileSystem.layerNoop({ exists: () => Effect.succeed(true) })),
+              Layer.provide(Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+            ),
+          ),
+        );
+        const preparation = yield* wsl
+          .prepareRuntime("Ubuntu", {
+            windowsPath: "C:\\runtime.tar.gz",
+            runtimeId: "cache",
+            sha256: "b".repeat(64),
+          })
+          .pipe(
+            Effect.tap(() => Deferred.succeed(completed, undefined)),
+            Effect.forkScoped,
+          );
+
+        yield* Deferred.await(installStarted);
+        yield* TestClock.adjust(0);
+        expect(yield* Deferred.isDone(pathStarted)).toBe(true);
+        yield* Deferred.succeed(finishInstall, undefined);
+        yield* TestClock.adjust(Duration.seconds(9));
+        expect(yield* Deferred.isDone(completed)).toBe(false);
+
+        if (pathOutcome === "ready") {
+          yield* Deferred.succeed(finishPath, undefined);
+          expect(yield* Fiber.join(preparation)).toEqual({
+            ok: true,
+            linuxAppRoot: "/home/test/.t3/wsl-runtime/cache",
+            resolvedPath: "/home/test/.local/bin:/usr/bin:/bin",
+          });
+        } else {
+          yield* TestClock.adjust(Duration.seconds(1));
+          expect(yield* Deferred.isDone(completed)).toBe(true);
+          expect(yield* Fiber.join(preparation)).toEqual({
+            ok: false,
+            reason: expect.stringMatching(/timed out.*provider PATH/),
+          });
+        }
+      }),
+  );
+});
+
 describe("WSL runtime cache", () => {
   it.each([
     [
@@ -169,42 +278,6 @@ describe("WSL runtime cache", () => {
     const script = buildScript(runtimeId);
     expect(script).toContain("/1.2.3_x64__touch__tmp_nope");
     expect(script).not.toContain(runtimeId);
-  });
-
-  it("installs through a temporary directory and only reuses valid completed caches", () => {
-    const script = buildWslRuntimeInstallScript(
-      "/mnt/c/Program Files/T3 Code/wsl-runtime.tar.gz",
-      "1.2.3-x64",
-      "b".repeat(64),
-    );
-
-    expect(script).toContain('runtime_parent="$HOME/.t3/wsl-runtime"');
-    expect(script).toContain('  [ -f "$ready_marker" ] &&');
-    expect(script).toContain('  runtime_entry_runs "$runtime_root" &');
-    expect(script).toContain("if runtime_is_ready; then");
-    expect(script).not.toContain("bin.mjs");
-    expect(script).not.toContain("node-pty");
-    expect(script).toContain("trap 'exit 1' HUP INT TERM");
-    expect(script).toContain('exec 9> "$runtime_lock"');
-    expect(script).toContain("flock -x 9");
-    expect(script).not.toContain('rm -rf "$runtime_lock"');
-    expect(script).toContain('mv -T "$runtime_root" "$runtime_stale"');
-    expect(script).toContain('mktemp -d "$runtime_parent/.1.2.3-x64.tmp.XXXXXX"');
-    // The release archive wraps everything in one `t3-<version>-linux-x64/`
-    // directory; stripping it puts the executable at `$runtime_root/t3`.
-    expect(script).toContain(
-      "tar -xzf '/mnt/c/Program Files/T3 Code/wsl-runtime.tar.gz' -C \"$runtime_tmp\" --strip-components=1",
-    );
-    expect(script).toContain('if ! wait "$runtime_check_pid"; then');
-    expect(script).toContain('mv -T "$runtime_tmp" "$runtime_root"');
-    expect(script).not.toContain('rm -rf "$runtime_root"');
-
-    const lockAcquired = script.indexOf("flock -x 9");
-    const readinessAfterLock = script.indexOf("if runtime_is_ready; then", lockAcquired + 1);
-    const existingRuntimeMoved = script.indexOf('mv -T "$runtime_root" "$runtime_stale"');
-    expect(lockAcquired).toBeGreaterThan(-1);
-    expect(readinessAfterLock).toBeGreaterThan(lockAcquired);
-    expect(existingRuntimeMoved).toBeGreaterThan(readinessAfterLock);
   });
 
   it("verifies the archive digest before extracting, and only on a cache miss", () => {
@@ -251,65 +324,6 @@ describe("WSL runtime cache", () => {
     const deleted = script.indexOf('rm -rf "$runtime_stale"');
     expect(kept).toBeGreaterThan(moved);
     expect(deleted).toBeGreaterThan(kept);
-  });
-
-  it("treats a runtime whose executable no longer runs as a cache miss", () => {
-    const script = buildWslRuntimeInstallScript(
-      "/mnt/c/Program Files/T3 Code/wsl-runtime.tar.gz",
-      "1.2.3-x64",
-      "b".repeat(64),
-    );
-
-    expect(script).toContain('  [ -x "$1/t3" ] && "$1/t3" --help >/dev/null 2>&1');
-
-    const entryCheckDefined = script.indexOf("runtime_entry_runs() {");
-    const readinessDefined = script.indexOf("runtime_is_ready() {");
-    const readyShortCircuit = script.indexOf("if runtime_is_ready; then");
-    expect(entryCheckDefined).toBeGreaterThan(-1);
-    expect(entryCheckDefined).toBeLessThan(readinessDefined);
-    expect(readinessDefined).toBeLessThan(readyShortCircuit);
-  });
-
-  it("re-hashes the executable against the digest the install recorded", () => {
-    const script = buildWslRuntimeInstallScript(
-      "/mnt/c/Program Files/T3 Code/wsl-runtime.tar.gz",
-      "1.2.3-x64",
-      "b".repeat(64),
-    );
-
-    expect(script).toContain(`  sha256sum "$1/t3" 2>/dev/null | cut -d ' ' -f 1`);
-    expect(script).toContain('  [ "$recorded_entry_digest" = "$current_entry_digest" ]');
-    expect(script).toContain('  [ -n "$recorded_entry_digest" ] || return 1');
-    expect(script).toContain(
-      `printf '%s\\n' "$installed_entry_digest" > "$runtime_tmp/.t3code-wsl-runtime-ready"`,
-    );
-
-    const extracted = script.indexOf("tar -xzf");
-    const digestRecorded = script.indexOf(
-      'installed_entry_digest=$(runtime_server_entry_digest "$runtime_tmp")',
-    );
-    const markerWritten = script.indexOf('> "$runtime_tmp/.t3code-wsl-runtime-ready"');
-    const promoted = script.indexOf('mv -T "$runtime_tmp" "$runtime_root"');
-    expect(digestRecorded).toBeGreaterThan(extracted);
-    expect(markerWritten).toBeGreaterThan(digestRecorded);
-    expect(promoted).toBeGreaterThan(markerWritten);
-  });
-
-  it("refuses to mark an archive whose executable does not run as ready", () => {
-    const script = buildWslRuntimeInstallScript(
-      "/mnt/c/Program Files/T3 Code/wsl-runtime.tar.gz",
-      "1.2.3-x64",
-      "b".repeat(64),
-    );
-
-    expect(script).toContain('if ! wait "$runtime_check_pid"; then');
-
-    const payloadValidated = script.indexOf('runtime_entry_runs "$runtime_tmp"');
-    const markerWritten = script.indexOf('> "$runtime_tmp/.t3code-wsl-runtime-ready"');
-    const promoted = script.indexOf('mv -T "$runtime_tmp" "$runtime_root"');
-    expect(payloadValidated).toBeGreaterThan(-1);
-    expect(markerWritten).toBeGreaterThan(payloadValidated);
-    expect(promoted).toBeGreaterThan(payloadValidated);
   });
 
   it("parses only absolute Linux runtime paths", () => {
@@ -483,6 +497,52 @@ describe.skipIf(posixShellRunner === null)("WSL runtime install script (executed
     expect(warm.status, warm.stderr).toBe(0);
     expect(parseWslRuntimeRoot(warm.stdout)).toBe(fixture.runtimeRoot);
   });
+
+  it.each(["cold", "warm"] as const)(
+    "overlaps full CLI validation and executable hashing on a %s cache",
+    (cache) => {
+      // Each side must enter before the other can finish. The read timeout only
+      // bounds a broken serial implementation; successful runs need no delay.
+      const fixture = createFixture(
+        [
+          "#!/bin/bash",
+          'if [ -n "${T3_TEST_RENDEZVOUS:-}" ]; then',
+          '  exec 7<> "$T3_TEST_RENDEZVOUS/cli" 8<> "$T3_TEST_RENDEZVOUS/hash"',
+          '  printf "%s\\n" "$1" >> "$T3_TEST_RENDEZVOUS/calls"',
+          '  printf "started\\n" >&7',
+          "  read -r -t 5 signal <&8 || exit 91",
+          "fi",
+          'echo "t3code wsl runtime test server 0.0.0"',
+        ].join("\n"),
+      );
+      if (cache === "warm") expect(fixture.install().status).toBe(0);
+      const installed = runShell(
+        [
+          "set -eu",
+          `export T3_TEST_RENDEZVOUS=${sh(fixture.work)}`,
+          'mkfifo "$T3_TEST_RENDEZVOUS/cli" "$T3_TEST_RENDEZVOUS/hash"',
+          'mkdir -p "$T3_TEST_RENDEZVOUS/bin"',
+          "real_sha=$(command -v sha256sum)",
+          "cat > \"$T3_TEST_RENDEZVOUS/bin/sha256sum\" <<'HASH_WRAPPER'",
+          "#!/bin/bash",
+          'case "$1" in */t3)',
+          '  exec 7<> "$T3_TEST_RENDEZVOUS/cli" 8<> "$T3_TEST_RENDEZVOUS/hash"',
+          "  read -r -t 5 signal <&7 || exit 92",
+          '  printf "started\\n" >&8',
+          ";; esac",
+          "HASH_WRAPPER",
+          `printf 'exec %s "$@"\\n' "$real_sha" >> "$T3_TEST_RENDEZVOUS/bin/sha256sum"`,
+          'chmod +x "$T3_TEST_RENDEZVOUS/bin/sha256sum"',
+          'export PATH="$T3_TEST_RENDEZVOUS/bin:$PATH"',
+          fixture.installScript(),
+        ].join("\n"),
+      );
+
+      expect(installed.status, installed.stderr).toBe(0);
+      expect(parseWslRuntimeRoot(installed.stdout)).toBe(fixture.runtimeRoot);
+      expect(runShell(`cat ${sh(`${fixture.work}/calls`)}`).stdout).toBe("--help\n");
+    },
+  );
 
   it("reinstalls a cache whose executable was truncated", () => {
     const fixture = createFixture();

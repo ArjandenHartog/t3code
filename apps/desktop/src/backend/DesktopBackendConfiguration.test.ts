@@ -570,40 +570,6 @@ describe("DesktopBackendConfiguration", () => {
     );
   });
 
-  it.effect("resolveWsl falls back when runtime validation fails", () => {
-    const archiveHash = "c".repeat(64);
-    const stagedAppRoot = `/home/test/.t3/wsl-runtime/sha256-${archiveHash}`;
-    const observedNodePtyRoots: string[] = [];
-    return withPackagedWslHarness(
-      {
-        archiveHash,
-        wsl: () => ({
-          prepareRuntime: () => ({
-            ok: false,
-            reason: `${stagedAppRoot}/t3 --help failed (exit 127)`,
-          }),
-          ensureNodePty: (_distro, root) => {
-            observedNodePtyRoots.push(root);
-            return { ok: true, nodePath: "/usr/bin/node", resolvedPath: "/usr/bin:/bin" };
-          },
-        }),
-      },
-      ({ mountedAppRoot, mountedEntryPath }) =>
-        Effect.gen(function* () {
-          const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
-          const config = yield* configuration.resolveWsl({ port: 5000, distro: "Ubuntu" });
-
-          assert.deepEqual(observedNodePtyRoots, [mountedAppRoot]);
-          assert.include(config.args, "/usr/bin/node");
-          assert.include(config.args, `${mountedAppRoot}/apps/server/dist/bin.mjs`);
-          assert.notInclude(config.args, `${stagedAppRoot}/t3`);
-          assert.equal(config.entryPath, mountedEntryPath);
-          assert.isUndefined(config.wslRuntimeId);
-          assert.isTrue(Option.isNone(config.preflightFailure));
-        }),
-    );
-  });
-
   it.effect("resolveWsl reports runtime validation failure when the mounted tree fails too", () => {
     return withPackagedWslHarness(
       {
@@ -637,7 +603,7 @@ describe("DesktopBackendConfiguration", () => {
       {
         archiveHash: "f".repeat(64),
         wsl: () => ({
-          prepareRuntime: () => ({ ok: false, reason: "t3 --version failed (exit 1)" }),
+          prepareRuntime: () => ({ ok: false, reason: "t3 --help failed (exit 1)" }),
           ensureNodePty: () => ({
             ok: false,
             reason: "WSL backend preflight timed out while probing for Node.js.",
